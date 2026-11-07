@@ -21,8 +21,10 @@ import json
 import os
 import random
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests
@@ -255,55 +257,177 @@ def post_calendar():
 
 
 # ---------------- 4) لمحة السوق ----------------
-# (الرمز بالمصدر، الاسم، عدد الخانات العشرية)
-STOOQ = [
-    ("XAUUSD", "🥇 الذهب XAU/USD", 2),
-    ("EURUSD", "💶 EUR/USD", 4),
-    ("GBPUSD", "💷 GBP/USD", 4),
-    ("USDJPY", "💴 USD/JPY", 3),
-    ("^SPX", "📈 S&P 500", 2),
-    ("^NDX", "📈 Nasdaq 100", 2),
+SESSION = requests.Session()
+SESSION.headers.update(UA)
+
+# (القسم، الاسم، رمز Yahoo، رمز Stooq البديل أو None، عدد الخانات العشرية)
+ASSETS = [
+    ("fx", "💶 EUR/USD", "EURUSD=X", "eurusd", 4),
+    ("fx", "💷 GBP/USD", "GBPUSD=X", "gbpusd", 4),
+    ("fx", "💴 USD/JPY", "USDJPY=X", "usdjpy", 3),
+    ("fx", "🇨🇭 USD/CHF", "USDCHF=X", "usdchf", 4),
+    ("fx", "🇦🇺 AUD/USD", "AUDUSD=X", "audusd", 4),
+    ("fx", "🇨🇦 USD/CAD", "USDCAD=X", "usdcad", 4),
+    ("fx", "🇳🇿 NZD/USD", "NZDUSD=X", "nzdusd", 4),
+    ("com", "🥇 الذهب (عقود آجلة)", "GC=F", "xauusd", 2),
+    ("com", "🥈 الفضة (عقود آجلة)", "SI=F", "xagusd", 3),
+    ("com", "🛢 نفط WTI", "CL=F", "cl.f", 2),
+    ("com", "🛢 نفط برنت", "BZ=F", None, 2),
+    ("idx", "🇺🇸 داو جونز", "^DJI", "^dji", 2),
+    ("idx", "🇺🇸 S&P 500", "^GSPC", "^spx", 2),
+    ("idx", "🇺🇸 ناسداك", "^IXIC", "^ndq", 2),
+    ("idx", "🇩🇪 DAX الألماني", "^GDAXI", "^dax", 2),
+    ("idx", "🇬🇧 FTSE 100", "^FTSE", "^ukx", 2),
+    ("idx", "🇯🇵 نيكاي 225", "^N225", "^nkx", 2),
+    ("idx", "💵 مؤشر الدولار DXY", "DX-Y.NYB", None, 2),
 ]
-CRYPTO = [("bitcoin", "🪙 Bitcoin (BTC)"), ("ethereum", "🔷 Ethereum (ETH)")]
+CRYPTO = [
+    ("cry", "🪙 Bitcoin (BTC)", "bitcoin", "BTC-USD", 0),
+    ("cry", "🔷 Ethereum (ETH)", "ethereum", "ETH-USD", 0),
+]
+SECTIONS = [
+    ("fx", "💱 العملات الرئيسية"),
+    ("com", "🏅 الذهب والمعادن والنفط"),
+    ("idx", "📈 المؤشرات"),
+    ("cry", "🪙 العملات الرقمية"),
+]
+STALE_AFTER = 6 * 3600  # أقدم من 6 ساعات = آخر إغلاق وليس سعراً حياً
+MIN_SHARE = 0.6         # أقل نسبة أصول لازم تنجلب حتى ننشر
 
 
 def fnum(x):
     try:
-        return float(x)
+        v = float(x)
+        return v if v == v else None  # يستبعد NaN
     except (TypeError, ValueError):
         return None
 
 
-def parse_stooq(text):
-    rows = {}
-    for row in csv.DictReader(io.StringIO(text)):
-        sym = (row.get("Symbol") or "").upper()
-        if sym:
-            rows[sym] = row
-    return rows
+def yahoo_quote(symbol):
+    """سعر أصل من Yahoo Finance. يرجع dict أو يرمي استثناء."""
+    last = None
+    for host in ("query1", "query2"):
+        url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{quote(symbol, safe='')}"
+        try:
+            r = SESSION.get(url, params={"range": "1d", "interval": "1d"}, timeout=20)
+            if r.status_code == 429:
+                last = RuntimeError("HTTP 429 (طلبات كثيرة)")
+                time.sleep(2)
+                continue
+            r.raise_for_status()
+            res = r.json()["chart"]["result"][0]
+            meta = res["meta"]
+            price = fnum(meta.get("regularMarketPrice"))
+            if price is None:
+                raise ValueError("ما في سعر بالرد")
+            prev = fnum(meta.get("chartPreviousClose"))
+            if prev is None:
+                prev = fnum(meta.get("previousClose"))
+            return {
+                "price": price,
+                "prev": prev,
+                "time": meta.get("regularMarketTime"),
+                "src": "yahoo",
+                "approx": False,
+            }
+        except Exception as e:  # نجرب المضيف التاني
+            last = e
+    raise RuntimeError(f"Yahoo فشل: {last}")
 
 
-def fetch_stooq():
-    syms = "+".join(s.lower() for s, _, _ in STOOQ)
-    url = f"https://stooq.com/q/l/?s={syms}&f=sd2t2ohlc&h&e=csv"
-    r = requests.get(url, headers=UA, timeout=30)
+def stooq_quote(symbol):
+    """سعر بديل من Stooq. التغير فيه تقريبي (من افتتاح اليوم)."""
+    r = SESSION.get(
+        "https://stooq.com/q/l/",
+        params={"s": symbol, "f": "sd2t2ohlc", "h": "", "e": "csv"},
+        timeout=20,
+    )
     r.raise_for_status()
-    return parse_stooq(r.text)
+    rows = list(csv.DictReader(io.StringIO(r.text)))
+    if not rows:
+        raise ValueError("رد فاضي")
+    row = rows[0]
+    close, open_ = fnum(row.get("Close")), fnum(row.get("Open"))
+    if close is None:
+        raise ValueError("ما في سعر (N/D)")
+    return {"price": close, "prev": open_, "time": None, "src": "stooq", "approx": True}
 
 
-def fetch_crypto():
-    r = requests.get(
+def coingecko_quotes(ids):
+    r = SESSION.get(
         "https://api.coingecko.com/api/v3/simple/price",
         params={
-            "ids": ",".join(c for c, _ in CRYPTO),
+            "ids": ",".join(ids),
             "vs_currencies": "usd",
             "include_24hr_change": "true",
+            "include_last_updated_at": "true",
         },
-        headers=UA,
-        timeout=30,
+        timeout=20,
     )
     r.raise_for_status()
     return r.json()
+
+
+def collect_quotes():
+    """يجلب كل الأصول. يرجع (quotes, failures). كل فشل بينطبع بالسجل."""
+    quotes, failures = {}, []
+
+    for sec, label, ysym, ssym, dec in ASSETS:
+        q, errs = None, []
+        for name, fn, sym in (("yahoo", yahoo_quote, ysym), ("stooq", stooq_quote, ssym)):
+            if not sym:
+                continue
+            try:
+                q = fn(sym)
+                break
+            except Exception as e:
+                errs.append(f"{name}:{sym}: {e}")
+            time.sleep(0.3)
+        if q:
+            quotes[label] = q
+            print(f"OK   [{q['src']}] {label} = {q['price']}")
+        else:
+            failures.append(label)
+            print(f"FAIL {label} -> " + " | ".join(errs))
+        time.sleep(0.3)
+
+    try:
+        cg = coingecko_quotes([c[2] for c in CRYPTO])
+    except Exception as e:
+        cg = {}
+        print(f"FAIL CoinGecko -> {e}")
+    for sec, label, cid, ysym, dec in CRYPTO:
+        d = cg.get(cid) or {}
+        price = fnum(d.get("usd"))
+        q = None
+        if price is not None:
+            q = {
+                "price": price,
+                "pct": fnum(d.get("usd_24h_change")),
+                "time": d.get("last_updated_at"),
+                "src": "coingecko",
+                "approx": False,
+            }
+        else:
+            try:
+                q = yahoo_quote(ysym)
+            except Exception as e:
+                print(f"FAIL {label} -> {e}")
+        if q:
+            quotes[label] = q
+            print(f"OK   [{q['src']}] {label} = {q['price']}")
+        else:
+            failures.append(label)
+        time.sleep(0.3)
+    return quotes, failures
+
+
+def pct_of(q):
+    if q.get("pct") is not None:
+        return q["pct"]
+    if q.get("prev"):
+        return (q["price"] - q["prev"]) / q["prev"] * 100
+    return None
 
 
 def change_text(pct):
@@ -313,62 +437,60 @@ def change_text(pct):
     return f"  ({arrow} {pct:+.2f}%)"
 
 
-def build_market_message(stooq_rows, crypto, now):
-    market_lines = []
-    stale = False
-    for sym, label, dec in STOOQ:
-        row = stooq_rows.get(sym)
-        if not row:
-            continue
-        close = fnum(row.get("Close"))
-        if close is None:
-            continue
-        open_ = fnum(row.get("Open"))
-        pct = (close - open_) / open_ * 100 if open_ else None
-        if row.get("Date") and row["Date"] != now.strftime("%Y-%m-%d"):
-            stale = True
-        market_lines.append(f"{label}: <b>{close:,.{dec}f}</b>{change_text(pct)}")
-
-    crypto_lines = []
-    for cid, label in CRYPTO:
-        d = crypto.get(cid) or {}
-        price = fnum(d.get("usd"))
-        if price is None:
-            continue
-        crypto_lines.append(
-            f"{label}: <b>${price:,.0f}</b>{change_text(fnum(d.get('usd_24h_change')))}"
-        )
-
-    if not market_lines and not crypto_lines:
+def build_market_message(quotes, now, now_ts=None):
+    """quotes: {label: dict}. يرجع نص المنشور أو None إذا ما في بيانات."""
+    now_ts = now_ts or now.timestamp()
+    decs = {label: dec for _, label, _, _, dec in ASSETS}
+    decs.update({label: dec for _, label, _, _, dec in CRYPTO})
+    by_section = {}
+    for sec, label, *_ in ASSETS + CRYPTO:
+        if label in quotes:
+            by_section.setdefault(sec, []).append(label)
+    if not by_section:
         return None
 
     lines = ["📊 <b>لمحة السوق</b>", f"🕐 {now:%H:%M} بتوقيت دمشق", ""]
-    if market_lines:
-        lines += ["<b>المعادن والعملات والمؤشرات</b>"] + market_lines + [""]
-    if crypto_lines:
-        lines += ["<b>العملات الرقمية</b>"] + crypto_lines + [""]
-    note = "التغير للأصول التقليدية منذ افتتاح اليوم، وللكريبتو خلال 24 ساعة. الأسعار تقريبية وقد تختلف عن منصتك."
-    if stale:
-        note += " بعض الأسعار هي آخر إغلاق."
+    approx = False
+    for sec, title in SECTIONS:
+        labels = by_section.get(sec)
+        if not labels:
+            continue
+        stale = sum(
+            1 for l in labels
+            if quotes[l].get("time") and now_ts - quotes[l]["time"] > STALE_AFTER
+        )
+        if stale * 2 >= len(labels):
+            title += " — آخر إغلاق"
+        lines.append(f"<b>{esc(title)}</b>")
+        for l in labels:
+            q = quotes[l]
+            approx = approx or q.get("approx", False)
+            lines.append(f"{esc(l)}: <b>{q['price']:,.{decs[l]}f}</b>{change_text(pct_of(q))}")
+        lines.append("")
+
+    note = (
+        "التغير مقارنة بإغلاق اليوم السابق، وللكريبتو خلال 24 ساعة. "
+        "الأسعار تقريبية وقد تختلف عن منصتك."
+    )
+    if approx:
+        note += " بعض التغيرات تقريبية من مصدر بديل."
     lines += [f"<i>{note}</i>", "", FOOTER]
     return "\n".join(lines)
 
 
 def post_market():
     now = datetime.now(TZ)
-    rows, crypto = {}, {}
-    try:
-        rows = fetch_stooq()
-    except Exception as e:
-        print("تعذر جلب أسعار المعادن والعملات:", e)
-    try:
-        crypto = fetch_crypto()
-    except Exception as e:
-        print("تعذر جلب أسعار الكريبتو:", e)
-    msg = build_market_message(rows, crypto, now)
-    if msg is None:
-        raise RuntimeError("ما قدرت أجيب أي سعر من المصادر")
-    send_text(msg)
+    quotes, failures = collect_quotes()
+    total = len(ASSETS) + len(CRYPTO)
+    traditional = sum(1 for _, l, *_ in ASSETS if l in quotes)
+    if traditional == 0 or len(quotes) < total * MIN_SHARE:
+        raise RuntimeError(
+            f"ما جبت إلا {len(quotes)} من {total} أصل، فما رح أنشر منشور ناقص. "
+            f"الفاشلة: {', '.join(failures)}"
+        )
+    send_text(build_market_message(quotes, now))
+    if failures:
+        print("تنبيه: نُشر المنشور بدون:", ", ".join(failures))
     print("تم نشر لمحة السوق.")
 
 
